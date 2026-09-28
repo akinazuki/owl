@@ -27,6 +27,16 @@
 #include "schedule.h"
 
 #include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <libgen.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <limits.h>
+#include <arpa/inet.h>
+#include <netinet/ether.h>
 
 #ifdef __APPLE__
 # define SIGSTATS SIGINFO
@@ -373,11 +383,84 @@ int awdl_init(struct daemon_state *state, const char *wlan, const char *host, st
 	state->next = NULL;
 	state->tx_queue_multicast = circular_buf_init(16);
 	state->dump = dump;
+	state->services_file = NULL;
+	state->services_last = NULL;
 
 	return 0;
 }
 
+#define AIRDROP_SERVICE_TIMEOUT_USEC (5 * 1000 * 1000)
+
+/* AirDrop peers seen in AWDL, for a client to read: instance\tipv6%iface\tport\tflags\tmac\tname per line */
+void awdl_write_services(struct ev_loop *loop __attribute__((unused)), ev_timer *timer,
+                         int revents __attribute__((unused))) {
+	struct daemon_state *state = timer->data;
+	struct awdl_peer *peer;
+	awdl_peers_it_t it;
+	size_t cap = 4096, used = 0;
+	char *content = malloc(cap);
+	char tmp[PATH_MAX];
+	FILE *f;
+
+	if (!content)
+		return;
+	content[0] = '\0';
+	it = awdl_peers_it_new(state->awdl_state.peers.peers);
+	while (awdl_peers_it_next(it, &peer) == PEERS_OK) {
+		struct in6_addr in6;
+		char addr[INET6_ADDRSTRLEN];
+		char line[512];
+		int n;
+		if (!peer->is_valid || !peer->airdrop.instance[0] || !peer->airdrop.port ||
+		    /* macOS announces AirDrop only while discoverable; drop stale peers */
+		    clock_time_us() - peer->airdrop.seen > AIRDROP_SERVICE_TIMEOUT_USEC)
+			continue;
+		rfc4291_addr(&peer->addr, &in6);
+		inet_ntop(AF_INET6, &in6, addr, sizeof(addr));
+		n = snprintf(line, sizeof(line), "%s\t%s%%%s\t%u\t%u\t%s\t%s\n", peer->airdrop.instance, addr,
+		             state->io.host_ifname, peer->airdrop.port, peer->airdrop.flags,
+		             ether_ntoa(&peer->addr), peer->name);
+		if (n <= 0 || n >= (int) sizeof(line))
+			continue;
+		if (used + n + 1 > cap) {
+			char *bigger = realloc(content, cap * 2);
+			if (!bigger)
+				break;
+			content = bigger;
+			cap *= 2;
+		}
+		memcpy(content + used, line, n + 1);
+		used += n;
+	}
+	awdl_peers_it_free(it);
+
+	if (state->services_last && !strcmp(state->services_last, content)) {
+		free(content);
+		return;
+	}
+	snprintf(tmp, sizeof(tmp), "%s.tmp", state->services_file);
+	f = fopen(tmp, "w");
+	if (!f) {
+		log_warn("cannot write %s: %s", tmp, strerror(errno));
+		free(content);
+		return;
+	}
+	fputs(content, f);
+	fclose(f);
+	if (rename(tmp, state->services_file) < 0) {
+		log_warn("cannot replace %s: %s", state->services_file, strerror(errno));
+		free(content);
+		return;
+	}
+	log_debug("AirDrop services updated (%zu bytes)", used);
+	free(state->services_last);
+	state->services_last = content;
+}
+
 void awdl_free(struct daemon_state *state) {
+	if (state->services_file)
+		unlink(state->services_file);
+	free(state->services_last);
 	circular_buf_free(state->tx_queue_multicast);
 	io_state_free(&state->io);
 	netutils_cleanup();
@@ -428,6 +511,16 @@ void awdl_schedule(struct ev_loop *loop, struct daemon_state *state) {
 	state->ev_state.tx_mcast_timer.data = (void *) state;
 	ev_timer_init(&state->ev_state.tx_mcast_timer, awdl_send_multicast, 0, 0);
 	ev_timer_start(loop, &state->ev_state.tx_mcast_timer);
+
+	if (state->services_file) {
+		char dir[PATH_MAX];
+		strncpy(dir, state->services_file, sizeof(dir) - 1);
+		dir[sizeof(dir) - 1] = '\0';
+		mkdir(dirname(dir), 0755);
+		state->ev_state.svc_timer.data = (void *) state;
+		ev_timer_init(&state->ev_state.svc_timer, awdl_write_services, 1., 1.);
+		ev_timer_start(loop, &state->ev_state.svc_timer);
+	}
 
 	/* Register signal to print statistics */
 	state->ev_state.stats.data = (void *) state;

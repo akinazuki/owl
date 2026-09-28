@@ -54,6 +54,11 @@ struct awdl_state {
 	uint8_t version;
 	uint8_t dev_class;
 
+	char service_instance[64];
+	char service_label[32];
+	char service_txt[64];
+	uint16_t service_port;
+
 	/* sequence number for data frames */
 	uint16_t sequence_number;
 	/* PSF interval (in TU) */

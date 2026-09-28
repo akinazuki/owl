@@ -337,7 +337,7 @@ int is_channel_available(int ifindex, const int channel, bool *is_available) {
 			.last_band = -1,
 		},
 	};
-	
+
 	freq = ieee80211_channel_to_frequency(channel);
 	if (!freq) {
 		log_error("Invalid channel number %d", channel);
@@ -414,7 +414,20 @@ int set_channel(int ifindex, int channel) {
 
 	NLA_PUT_U32(m, NL80211_ATTR_IFINDEX, ifindex);
 	NLA_PUT_U32(m, NL80211_ATTR_WIPHY_FREQ, freq);
-	NLA_PUT_U32(m, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_HT40PLUS);
+	if (channel > 14) {
+		/* AWDL 5GHz = opclass 128 (80MHz); tune the 80MHz block or 40MHz can't decode it */
+		int center;
+		if (channel >= 149)
+			center = 155;
+		else if (channel >= 100)
+			center = 106 + ((channel - 100) / 16) * 16;
+		else
+			center = 42 + ((channel - 36) / 16) * 16;
+		NLA_PUT_U32(m, NL80211_ATTR_CHANNEL_WIDTH, NL80211_CHAN_WIDTH_80);
+		NLA_PUT_U32(m, NL80211_ATTR_CENTER_FREQ1, ieee80211_channel_to_frequency(center));
+	} else {
+		NLA_PUT_U32(m, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_HT40PLUS);
+	}
 
 	err = nl_send_auto(nl80211_state.socket, m);
 	if (err < 0) {

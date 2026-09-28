@@ -18,6 +18,8 @@
  */
 
 #include <string.h>
+#include <strings.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/ip6.h>
@@ -205,6 +207,125 @@ wire_error:
 	return RX_TOO_SHORT;
 }
 
+/* AWDL DNS compression: codes 0xC000..0xC00E -> these suffixes (0xC000 = empty) */
+static const char *const awdl_dns_dictionary[] = {
+	NULL, "_airplay._tcp.local", "_airplay._udp.local", "_airplay",
+	"_raop._tcp.local", "_raop._udp.local", "_raop", "_airdrop._tcp.local",
+	"_airdrop._udp.local", "_airdrop", "_tcp.local", "_udp.local", "local", "ip6.arpa", "ip4.arpa",
+};
+
+static int awdl_dns_name_decode(const uint8_t *data, int len, char *out, size_t out_len) {
+	size_t used = 0;
+	int i = 0;
+	out[0] = '\0';
+	while (i < len) {
+		const char *component;
+		size_t component_len;
+		char label[64];
+		if (data[i] & 0xc0) {
+			unsigned code;
+			if (i + 2 > len)
+				return -1;
+			code = ((unsigned) (data[i] & 0x3f) << 8) | data[i + 1];
+			i += 2;
+			if (code >= sizeof(awdl_dns_dictionary) / sizeof(awdl_dns_dictionary[0]))
+				return -1;
+			component = awdl_dns_dictionary[code];
+			if (!component)
+				continue;
+			component_len = strlen(component);
+		} else {
+			component_len = data[i];
+			if (i + 1 + (int) component_len > len || component_len >= sizeof(label))
+				return -1;
+			memcpy(label, data + i + 1, component_len);
+			label[component_len] = '\0';
+			component = label;
+			i += 1 + component_len;
+		}
+		if (used + (used ? 1 : 0) + component_len + 1 > out_len)
+			return -1;
+		if (used)
+			out[used++] = '.';
+		memcpy(out + used, component, component_len);
+		used += component_len;
+		out[used] = '\0';
+	}
+	return 0;
+}
+
+#define AWDL_AIRDROP_SERVICE "_airdrop._tcp.local"
+
+/* service TLV: name_len(LE16, +1 for the type byte), name, type, data_len(LE16), 2 pad, rdata */
+int awdl_handle_service_response_tlv(struct awdl_peer *src, const struct buf *val,
+                                     struct awdl_state *state __attribute__((unused)), uint64_t now) {
+	const uint8_t *data = buf_data(val);
+	int len = buf_len(val);
+	char name[256], target[256];
+	int name_len, offset, data_len;
+	uint8_t type;
+	size_t service_len = strlen(AWDL_AIRDROP_SERVICE);
+	size_t n;
+
+	if (len < 2)
+		return RX_IGNORE;
+	name_len = data[0] | (data[1] << 8);
+	if (name_len < 1 || 2 + name_len + 4 > len)
+		return RX_IGNORE;
+	if (awdl_dns_name_decode(data + 2, name_len - 1, name, sizeof(name)))
+		return RX_IGNORE;
+	offset = 2 + name_len - 1;
+	type = data[offset++];
+	data_len = data[offset] | (data[offset + 1] << 8);
+	offset += 4; /* data_len + 2 pad bytes */
+	if (offset + data_len > len)
+		return RX_IGNORE;
+	data += offset;
+	n = strlen(name);
+
+	if (type == 12  && !strcasecmp(name, AWDL_AIRDROP_SERVICE)) {
+		if (awdl_dns_name_decode(data, data_len, target, sizeof(target)))
+			return RX_IGNORE;
+		if (strcasecmp(src->airdrop.instance, target)) {
+			strncpy(src->airdrop.instance, target, AWDL_SERVICE_INSTANCE_MAX);
+			src->airdrop.instance[AWDL_SERVICE_INSTANCE_MAX] = '\0';
+			src->airdrop.port = 0;
+			src->airdrop.flags = 0;
+			log_debug("peer %s advertises AirDrop instance %s", ether_ntoa(&src->addr), src->airdrop.instance);
+		}
+		src->airdrop.seen = now;
+		return RX_OK;
+	}
+
+	if (n <= service_len + 1 || strcasecmp(name + n - service_len, AWDL_AIRDROP_SERVICE) ||
+	    name[n - service_len - 1] != '.' || !src->airdrop.instance[0] ||
+	    strlen(src->airdrop.instance) != n - service_len - 1 ||
+	    strncasecmp(name, src->airdrop.instance, n - service_len - 1))
+		return RX_IGNORE;
+
+	if (type == 33 ) {
+		if (data_len < 6)
+			return RX_IGNORE;
+		src->airdrop.port = (uint16_t) ((data[4] << 8) | data[5]);
+	} else if (type == 16 ) {
+		int i = 0;
+		while (i < data_len) {
+			int l = data[i];
+			char entry[64];
+			if (i + 1 + l > data_len)
+				break;
+			if (l < (int) sizeof(entry)) {
+				memcpy(entry, data + i + 1, l);
+				entry[l] = '\0';
+				if (!strncasecmp(entry, "flags=", 6))
+					src->airdrop.flags = (uint32_t) strtoul(entry + 6, NULL, 10);
+			}
+			i += 1 + l;
+		}
+	}
+	return RX_OK;
+}
+
 int awdl_handle_tlv(struct awdl_peer *src, uint8_t type, const struct buf *val,
                     struct awdl_state *state, uint64_t tsft) {
 	switch (type) {
@@ -222,6 +343,8 @@ int awdl_handle_tlv(struct awdl_peer *src, uint8_t type, const struct buf *val,
 			return awdl_handle_data_path_state_tlv(src, val, state);
 		case AWDL_VERSION_TLV:
 			return awdl_handle_version_tlv(src, val, state);
+		case AWDL_SERVICE_RESPONSE_TLV:
+			return awdl_handle_service_response_tlv(src, val, state, tsft);
 		case AWDL_SYNCTREE_TLV: /* seems to be buggy, not used in our election process */
 			/* fall through */
 		default:
@@ -305,9 +428,12 @@ int awdl_rx_action(const struct buf *frame, signed char rssi, uint64_t tsft,
 		buf_strip(frame, len);
 	}
 
-	if (buf_len(frame) > 0) {
+	if (buf_len(frame) >= 3) {
 		log_debug("awdl_action: unexpected bytes (%d) at end of frame", buf_len(frame));
 		return RX_UNEXPECTED_FORMAT;
+	} else if (buf_len(frame) > 0) {
+		/* newer macOS pads MIFs with < 3 zero bytes; don't reject the frame for them */
+		log_trace("awdl_action: ignoring %d padding bytes at end of frame", buf_len(frame));
 	}
 
 	if (subtype == AWDL_ACTION_MIF)

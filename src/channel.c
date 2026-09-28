@@ -47,6 +47,16 @@ void awdl_chanseq_init_idle(struct awdl_chan *seq) {
 	}
 }
 
+/* ch44, plus ch6 at slot 8 to overlap a Mac's idle availability */
+void awdl_chanseq_init_social(struct awdl_chan *seq) {
+	for (int i = 0; i < AWDL_CHANSEQ_LENGTH; i++) {
+		if (i == 8)
+			seq[i] = CHAN_OPCLASS_6;
+		else
+			seq[i] = CHAN_OPCLASS_44;
+	}
+}
+
 void awdl_chanseq_init_static(struct awdl_chan *seq, const struct awdl_chan *chan) {
 	for (int i = 0; i < AWDL_CHANSEQ_LENGTH; i++, seq++) {
 		*seq = *chan;

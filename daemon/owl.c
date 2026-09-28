@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <signal.h>
+#include <string.h>
 #include <syslog.h>
 #include <errno.h>
 #include <ev.h>
@@ -82,6 +83,11 @@ static void daemonize() {
 	openlog("owl", LOG_PID, LOG_DAEMON);
 }
 
+static void stop_loop(struct ev_loop *loop, ev_signal *handle __attribute__((unused)),
+                      int revents __attribute__((unused))) {
+	ev_break(loop, EVBREAK_ALL);
+}
+
 int main(int argc, char *argv[]) {
 	int c;
 	int daemon = 0;
@@ -94,12 +100,16 @@ int main(int argc, char *argv[]) {
 
 	char wlan[PATH_MAX] = "";
 	char host[IFNAMSIZ] = DEFAULT_AWDL_DEVICE;
+	const char *services_file = "/run/owl/airdrop.tsv";
+	const char *advertise = NULL;
+	int election_metric = 0;
+	int hop = 0;
 
 	struct ev_loop *loop;
 
 	struct daemon_state state;
 
-	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fN")) != -1) {
+	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNS:A:M:H")) != -1) {
 		switch (c) {
 			case 'D':
 				daemon = 1;
@@ -125,6 +135,18 @@ int main(int argc, char *argv[]) {
 				break;
 			case 'N':
 				no_monitor_mode = 1;
+				break;
+			case 'S':
+				services_file = *optarg ? optarg : NULL;
+				break;
+			case 'A':
+				advertise = optarg;
+				break;
+			case 'H':
+				hop = 1;
+				break;
+			case 'M':
+				election_metric = atoi(optarg);
 				break;
 			case '?':
 				if (optopt == 'i')
@@ -193,6 +215,42 @@ int main(int argc, char *argv[]) {
 		return EXIT_FAILURE;
 	}
 	state.awdl_state.filter_rssi = filter_rssi;
+	state.services_file = services_file;
+	if (hop) {
+		awdl_chanseq_init_social(state.awdl_state.channel.sequence);
+		log_info("Using social channel-hopping sequence (44/6)");
+	}
+	if (election_metric > 0) {
+		/* election compares counter first; Macs' counters are huge, so counter wins, not metric */
+		uint32_t counter = 100000000;
+		state.awdl_state.election.self_metric = (uint32_t) election_metric;
+		state.awdl_state.election.master_metric = (uint32_t) election_metric;
+		state.awdl_state.election.self_counter = counter;
+		state.awdl_state.election.master_counter = counter;
+		log_info("Election metric=%d counter=%u (will become AWDL master)", election_metric, counter);
+	}
+	if (advertise) {
+		char tmp[256];
+		char *instance, *label, *port, *txt, *save = NULL;
+		strncpy(tmp, advertise, sizeof(tmp) - 1);
+		tmp[sizeof(tmp) - 1] = '\0';
+		instance = strtok_r(tmp, ",", &save);
+		label = strtok_r(NULL, ",", &save);
+		port = strtok_r(NULL, ",", &save);
+		txt = strtok_r(NULL, ",", &save);
+		if (instance && label && port) {
+			strncpy(state.awdl_state.service_instance, instance, sizeof(state.awdl_state.service_instance) - 1);
+			strncpy(state.awdl_state.service_label, label, sizeof(state.awdl_state.service_label) - 1);
+			if (txt)
+				strncpy(state.awdl_state.service_txt, txt, sizeof(state.awdl_state.service_txt) - 1);
+			state.awdl_state.service_port = (uint16_t) atoi(port);
+			log_info("Advertising %s.%s._tcp.local port %u over AWDL",
+			         state.awdl_state.service_instance, state.awdl_state.service_label,
+			         state.awdl_state.service_port);
+		} else {
+			log_error("Invalid -A format; use instance,label,port[,txt]");
+		}
+	}
 
 	if (state.io.wlan_ifindex)
 		log_info("WLAN device: %s (addr %s)", state.io.wlan_ifname, ether_ntoa(&state.io.if_ether_addr));
@@ -202,6 +260,12 @@ int main(int argc, char *argv[]) {
 	loop = EV_DEFAULT;
 
 	awdl_schedule(loop, &state);
+
+	ev_signal sigint, sigterm;
+	ev_signal_init(&sigint, stop_loop, SIGINT);
+	ev_signal_start(loop, &sigint);
+	ev_signal_init(&sigterm, stop_loop, SIGTERM);
+	ev_signal_start(loop, &sigterm);
 
 	ev_run(loop, 0);
 

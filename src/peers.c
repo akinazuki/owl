@@ -74,6 +74,7 @@ struct awdl_peer *awdl_peer_new(const struct ether_addr *addr) {
 	peer->version = 0;
 	peer->supports_v2 = 0;
 	peer->sent_mif = 0;
+	memset(&peer->airdrop, 0, sizeof(peer->airdrop));
 	strcpy(peer->name, "");
 	strcpy(peer->country_code, "NA");
 	peer->is_valid = 0;

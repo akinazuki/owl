@@ -68,5 +68,6 @@ void awdl_chanseq_init(struct awdl_chan *seq);
 void awdl_chanseq_init_idle(struct awdl_chan *seq);
 
 void awdl_chanseq_init_static(struct awdl_chan *seq, const struct awdl_chan *chan);
+void awdl_chanseq_init_social(struct awdl_chan *seq);
 
 #endif /* AWDL_CHANNEL_H_ */

@@ -35,6 +35,15 @@ enum peers_status {
 	PEERS_INTERNAL = -2, /* Internal error */
 };
 
+#define AWDL_SERVICE_INSTANCE_MAX 63
+
+struct awdl_airdrop_service {
+	char instance[AWDL_SERVICE_INSTANCE_MAX + 1];
+	uint16_t port;
+	uint32_t flags;
+	uint64_t seen;
+};
+
 struct awdl_peer {
 	const struct ether_addr addr;
 	uint64_t last_update;
@@ -44,6 +53,7 @@ struct awdl_peer {
 	char name[HOST_NAME_LENGTH_MAX + 1]; /* space for trailing zero */
 	char country_code[2 + 1];
 	struct ether_addr infra_addr;
+	struct awdl_airdrop_service airdrop;
 	uint8_t version;
 	uint8_t devclass;
 	uint8_t supports_v2 : 1;

@@ -18,6 +18,7 @@
  */
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <radiotap.h>
@@ -318,6 +319,44 @@ int ieee80211_init_radiotap_header(uint8_t *buf) {
 	return ptr - buf;
 }
 
+static int data_mcs(void) {
+	static int mcs = -2;
+	if (mcs == -2) {
+		const char *env = getenv("OWL_DATA_MCS");
+		mcs = env ? atoi(env) : 5;
+	}
+	return mcs;
+}
+
+/* fixed 40MHz HT/VHT MCS instead of 12M legacy; multicast keeps the robust rate */
+int ieee80211_init_radiotap_header_data(uint8_t *buf, int is_5ghz) {
+	struct ieee80211_radiotap_header *hdr = (struct ieee80211_radiotap_header *) buf;
+	uint8_t *ptr = buf + sizeof(struct ieee80211_radiotap_header);
+	int mcs = data_mcs();
+
+	if (mcs < 0)
+		return ieee80211_init_radiotap_header(buf);
+
+	hdr->it_version = 0;
+	hdr->it_pad = 0;
+	if (is_5ghz) {
+		memset(ptr, 0, 12);
+		*(uint16_t *) ptr = htole16(0x0004  | 0x0040 );
+		ptr[3] = 1;
+		ptr[4] = (uint8_t) (((mcs > 9 ? 9 : mcs) << 4) | 1);
+		ptr += 12;
+		hdr->it_present = htole32(1u << 21);
+	} else {
+		ptr[0] = 0x01  | 0x02  | 0x04 ;
+		ptr[1] = 1;
+		ptr[2] = (uint8_t) (mcs > 7 ? 7 : mcs);
+		ptr += 3;
+		hdr->it_present = htole32(1u << 19);
+	}
+	hdr->it_len = htole16((uint16_t) (ptr - buf));
+	return ptr - buf;
+}
+
 int ieee80211_init_awdl_hdr(uint8_t *buf, const struct ether_addr *src, const struct ether_addr *dst,
                             struct ieee80211_state *state, uint16_t type) {
 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *) buf;
@@ -360,6 +399,92 @@ int ieee80211_add_fcs(const uint8_t *start, uint8_t *end) {
 	return sizeof(uint32_t);
 }
 
+
+#define AWDL_DNS_C_NULL       0xc000
+#define AWDL_DNS_C_TCP_LOCAL  0xc00a
+#define AWDL_DNS_C_LOCAL      0xc00c
+
+static uint8_t *awdl_dns_put_u16be(uint8_t *p, uint16_t v) {
+	*p++ = (uint8_t) (v >> 8);
+	*p++ = (uint8_t) (v & 0xff);
+	return p;
+}
+
+static uint8_t *awdl_dns_put_label(uint8_t *p, const char *s) {
+	size_t n = strlen(s);
+	if (n > 63)
+		n = 63;
+	*p++ = (uint8_t) n;
+	memcpy(p, s, n);
+	return p + n;
+}
+
+/* one service TLV; layout mirrors the parser in rx.c */
+static uint8_t *awdl_put_service_tlv(uint8_t *p, const uint8_t *name, int name_len,
+                                     uint8_t rtype, const uint8_t *rdata, int rdata_len) {
+	uint8_t *taglen, *val;
+	*p++ = AWDL_SERVICE_RESPONSE_TLV;
+	taglen = p;
+	p += 2;
+	val = p;
+	*p++ = (uint8_t) ((name_len + 1) & 0xff);
+	*p++ = (uint8_t) ((name_len + 1) >> 8);
+	memcpy(p, name, name_len);
+	p += name_len;
+	*p++ = rtype;
+	*p++ = (uint8_t) (rdata_len & 0xff);
+	*p++ = (uint8_t) (rdata_len >> 8);
+	*p++ = 0;
+	*p++ = 0;
+	memcpy(p, rdata, rdata_len);
+	p += rdata_len;
+	taglen[0] = (uint8_t) ((p - val) & 0xff);
+	taglen[1] = (uint8_t) ((p - val) >> 8);
+	return p;
+}
+
+int awdl_init_service_response_tlv(uint8_t *buf, const struct awdl_state *state) {
+	uint8_t type_name[96], inst_name[160], rdata[160];
+	uint8_t *p = buf, *n, *r;
+	int type_name_len, inst_name_len;
+
+	if (!state->service_port || !state->service_instance[0] || !state->service_label[0])
+		return 0;
+
+	n = type_name;
+	n = awdl_dns_put_label(n, state->service_label);
+	n = awdl_dns_put_u16be(n, AWDL_DNS_C_TCP_LOCAL);
+	type_name_len = n - type_name;
+
+	n = inst_name;
+	n = awdl_dns_put_label(n, state->service_instance);
+	n = awdl_dns_put_label(n, state->service_label);
+	n = awdl_dns_put_u16be(n, AWDL_DNS_C_TCP_LOCAL);
+	inst_name_len = n - inst_name;
+
+	r = rdata;
+	r = awdl_dns_put_label(r, state->service_instance);
+	r = awdl_dns_put_u16be(r, AWDL_DNS_C_NULL);
+	p = awdl_put_service_tlv(p, type_name, type_name_len, 12, rdata, r - rdata);
+
+	r = rdata;
+	r = awdl_dns_put_u16be(r, 0);
+	r = awdl_dns_put_u16be(r, 0);
+	r = awdl_dns_put_u16be(r, state->service_port);
+	r = awdl_dns_put_label(r, state->name);
+	r = awdl_dns_put_u16be(r, AWDL_DNS_C_LOCAL);
+	p = awdl_put_service_tlv(p, inst_name, inst_name_len, 33, rdata, r - rdata);
+
+	r = rdata;
+	if (state->service_txt[0])
+		r = awdl_dns_put_label(r, state->service_txt);
+	else
+		*r++ = 0;
+	p = awdl_put_service_tlv(p, inst_name, inst_name_len, 16, rdata, r - rdata);
+
+	return p - buf;
+}
+
 int awdl_init_full_action_frame(uint8_t *buf, struct awdl_state *state, struct ieee80211_state *ieee80211_state,
                                 enum awdl_action_type type) {
 	uint8_t *ptr = buf;
@@ -376,6 +501,8 @@ int awdl_init_full_action_frame(uint8_t *buf, struct awdl_state *state, struct i
 		ptr += awdl_init_ht_capabilities_tlv(ptr, state);
 	if (type == AWDL_ACTION_MIF)
 		ptr += awdl_init_arpa_tlv(ptr, state);
+	if (type == AWDL_ACTION_MIF)
+		ptr += awdl_init_service_response_tlv(ptr, state);
 	ptr += awdl_init_data_path_state_tlv(ptr, state);
 	ptr += awdl_init_version_tlv(ptr, state);
 	if (ieee80211_state->fcs)
@@ -389,7 +516,10 @@ int awdl_init_full_data_frame(uint8_t *buf, const struct ether_addr *src, const 
                               struct awdl_state *state, struct ieee80211_state *ieee80211_state) {
 	uint8_t *ptr = buf;
 
-	ptr += ieee80211_init_radiotap_header(ptr);
+	if (dst->ether_addr_octet[0] & 0x01)
+		ptr += ieee80211_init_radiotap_header(ptr);
+	else
+		ptr += ieee80211_init_radiotap_header_data(ptr, awdl_chan_num(state->channel.current, state->channel.enc) > 14);
 	ptr += ieee80211_init_awdl_data_hdr(ptr, src, dst, ieee80211_state);
 	ptr += llc_init_awdl_hdr(ptr);
 	ptr += awdl_init_data(ptr, state);

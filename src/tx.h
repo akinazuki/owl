@@ -49,6 +49,8 @@ int awdl_init_data_path_state_tlv(uint8_t *buf, const struct awdl_state *);
 
 int awdl_init_arpa_tlv(uint8_t *buf, const struct awdl_state *);
 
+int awdl_init_service_response_tlv(uint8_t *buf, const struct awdl_state *);
+
 int awdl_init_version_tlv(uint8_t *buf, const struct awdl_state *);
 
 int awdl_init_full_action_frame(uint8_t *buf, struct awdl_state *, struct ieee80211_state *, enum awdl_action_type);
